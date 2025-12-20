@@ -1,22 +1,36 @@
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Palette, 
   Rocket, 
   Layout, 
   CheckCircle2, 
-  Loader2, 
   ArrowRight, 
   Download, 
   FileText, 
   Layers,
-  Sparkles
+  Sparkles,
+  Key,
+  AlertCircle
 } from 'lucide-react';
-import { BrandInfo, LogoConcept, StyleGuide, AppStep } from './types';
-import { GeminiService } from './services/geminiService';
+import { GoogleGenAI, Type } from "@google/genai";
+import { BrandInfo, LogoConcept, StyleGuide, AppStep } from './types.ts';
+
+declare global {
+  interface AIStudio {
+    hasSelectedApiKey: () => Promise<boolean>;
+    openSelectKey: () => Promise<void>;
+  }
+  interface Window {
+    // Fixed: Removed readonly to match other potential global declarations and satisfy TypeScript's requirement for identical modifiers across interface merges.
+    aistudio: AIStudio;
+  }
+}
 
 export default function App() {
   const [step, setStep] = useState<AppStep>(AppStep.IDLE);
+  const [hasKey, setHasKey] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [brandInfo, setBrandInfo] = useState<BrandInfo>({
     businessName: '',
     industry: '',
@@ -29,372 +43,316 @@ export default function App() {
   const [styleGuide, setStyleGuide] = useState<StyleGuide | null>(null);
   const [loadingMsg, setLoadingMsg] = useState('');
 
-  const handleStartWizard = () => setStep(AppStep.WIZARD);
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio) {
+        try {
+          const selected = await window.aistudio.hasSelectedApiKey();
+          setHasKey(selected);
+        } catch (e) {
+          console.error("Key check failed", e);
+        }
+      }
+    };
+    checkKey();
+  }, []);
 
-  const handleGenerate = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleOpenKeySelector = async () => {
+    if (window.aistudio) {
+      await window.aistudio.openSelectKey();
+      setHasKey(true); // Proceed assuming success per documentation race condition guidelines
+      return true;
+    }
+    return false;
+  };
+
+  const generateLogoConcepts = async (brand: BrandInfo): Promise<LogoConcept[]> => {
+    // Create new GoogleGenAI instance right before making an API call per guidelines
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const styles = [
+      "minimalist vector emblem",
+      "bold modern geometric icon",
+      "elegant premium typography mark"
+    ];
+
+    const promises = styles.map(async (styleModifier, index) => {
+      const prompt = `Create a professional logo for "${brand.businessName}", in the ${brand.industry} industry. 
+      Core Values: ${brand.coreValues}. Style: ${brand.preferredStyle}, ${styleModifier}. 
+      Target Audience: ${brand.targetAudience}. 
+      Requirements: Clean design, solid white background, high resolution, professional brand mark.`;
+
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-pro-image-preview',
+          contents: { parts: [{ text: prompt }] },
+          config: {
+            imageConfig: { aspectRatio: "1:1", imageSize: "1K" }
+          }
+        });
+
+        let imageUrl = "";
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.inlineData) {
+            imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+          }
+        }
+
+        if (!imageUrl) throw new Error("The design engine did not return an image part.");
+
+        return {
+          id: `concept-${index}`,
+          imageUrl,
+          conceptName: `Concept ${index + 1}`,
+          description: `Strategic design focusing on ${styleModifier}.`
+        } as LogoConcept;
+      } catch (err: any) {
+        console.error("Individual Generation Error:", err);
+        // Handle "Requested entity was not found" error by indicating key issues
+        if (err.message?.includes("entity was not found")) {
+          throw new Error("PRO_KEY_NEEDED");
+        }
+        throw err;
+      }
+    });
+
+    return Promise.all(promises);
+  };
+
+  const handleGenerate = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setErrorMsg(null);
+
+    // If no key is selected, we must open the selector
+    if (!hasKey && window.aistudio) {
+      const success = await handleOpenKeySelector();
+      if (!success) return;
+    }
+
     setStep(AppStep.GENERATING);
-    setLoadingMsg('Analyzing brand identity...');
+    setLoadingMsg('Connecting to Creative Engine...');
     
     try {
-      setLoadingMsg('Crafting 3 unique logo concepts...');
-      const results = await GeminiService.generateLogoConcepts(brandInfo);
+      const results = await generateLogoConcepts(brandInfo);
       setConcepts(results);
       setStep(AppStep.GALLERY);
-    } catch (error) {
-      console.error(error);
-      alert('Failed to generate logos. Please try again.');
-      setStep(AppStep.WIZARD);
+    } catch (error: any) {
+      console.error("Design Generation Error:", error);
+      if (error.message === "PRO_KEY_NEEDED") {
+        setErrorMsg("Professional model requires a paid API key and billing setup. Please select a key from a paid GCP project.");
+        setStep(AppStep.WIZARD);
+        await handleOpenKeySelector();
+      } else {
+        setErrorMsg(`Design process interrupted: ${error.message || "Network Error"}.`);
+        setStep(AppStep.WIZARD);
+      }
     }
   };
 
   const handleSelectLogo = async (concept: LogoConcept) => {
     setSelectedConcept(concept);
     setStep(AppStep.GENERATING);
-    setLoadingMsg('Generating professional style guide...');
+    setLoadingMsg('Crafting your full brand style guide...');
     
     try {
-      const guide = await GeminiService.generateStyleGuide(brandInfo, concept);
-      setStyleGuide(guide);
+      // Create new GoogleGenAI instance right before making an API call per guidelines
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const prompt = `Based on a logo for "${brandInfo.businessName}" that is ${concept.description}, provide a professional style guide (JSON format).`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              primaryColor: { type: Type.STRING },
+              secondaryColor: { type: Type.STRING },
+              accentColor: { type: Type.STRING },
+              fontFamily: { type: Type.STRING },
+              usageTips: { type: Type.ARRAY, items: { type: Type.STRING } }
+            },
+            required: ["primaryColor", "secondaryColor", "accentColor", "fontFamily", "usageTips"]
+          }
+        }
+      });
+
+      setStyleGuide(JSON.parse(response.text || '{}'));
       setStep(AppStep.STYLE_GUIDE);
-    } catch (error) {
-      console.error(error);
-      alert('Error creating style guide.');
+    } catch (error: any) {
+      console.error("Style Guide Error:", error);
+      alert('Error creating style guide. You can still download your logo below.');
       setStep(AppStep.GALLERY);
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
-      {/* Header */}
+    <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 cursor-pointer" onClick={() => setStep(AppStep.IDLE)}>
-            <div className="bg-indigo-600 p-2 rounded-lg">
+          <div className="flex items-center gap-2 cursor-pointer group" onClick={() => setStep(AppStep.IDLE)}>
+            <div className="bg-indigo-600 p-2 rounded-lg group-hover:scale-105 transition-transform">
               <Palette className="w-6 h-6 text-white" />
             </div>
-            <span className="text-xl font-bold text-slate-900 tracking-tight">Logosmith AI</span>
+            <span className="text-xl font-black text-slate-900 tracking-tight">Logosmith AI</span>
           </div>
-          <div className="flex items-center gap-4 text-sm font-medium text-slate-500">
-            <span className={step === AppStep.WIZARD ? "text-indigo-600 font-bold" : ""}>1. Brand</span>
-            <ArrowRight className="w-4 h-4" />
-            <span className={step === AppStep.GALLERY ? "text-indigo-600 font-bold" : ""}>2. Concepts</span>
-            <ArrowRight className="w-4 h-4" />
-            <span className={step === AppStep.STYLE_GUIDE ? "text-indigo-600 font-bold" : ""}>3. Guide</span>
+          
+          <div className="flex items-center gap-4">
+            <button 
+              onClick={handleOpenKeySelector}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold border transition-colors ${hasKey ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-amber-50 text-amber-700 border-amber-200"}`}
+            >
+              <Key className="w-4 h-4" /> {hasKey ? "Key Connected" : "Connect Pro Key"}
+            </button>
           </div>
         </div>
       </header>
 
       <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 w-full">
         {step === AppStep.IDLE && (
-          <div className="text-center space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
-            <div className="inline-flex items-center gap-2 bg-indigo-50 text-indigo-700 px-4 py-2 rounded-full text-sm font-semibold">
-              <Sparkles className="w-4 h-4" />
-              AI-Powered Logo Studio
+          <div className="text-center space-y-12 animate-in fade-in duration-700">
+            <div className="space-y-6">
+              <h1 className="text-6xl font-black text-slate-900 tracking-tight">
+                Branding for <br />
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-fuchsia-600">
+                  Entrepreneurs
+                </span>
+              </h1>
+              <p className="max-w-xl mx-auto text-xl text-slate-500 font-medium">
+                Generate studio-quality logos and style guides for your business instantly.
+              </p>
             </div>
-            <h1 className="text-5xl font-extrabold text-slate-900 leading-tight">
-              Design a Professional Logo <br />
-              <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-violet-600">
-                For Your Small Business
-              </span>
-            </h1>
-            <p className="max-w-2xl mx-auto text-lg text-slate-600">
-              Transform your brand identity into a modern, memorable visual. 
-              Get 3 custom concepts and a full style guide in minutes.
-            </p>
-            <div className="flex justify-center gap-4">
-              <button 
-                onClick={handleStartWizard}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-xl font-bold shadow-lg shadow-indigo-200 transition-all flex items-center gap-2 group"
-              >
-                Start Your Project
-                <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-              </button>
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-16 pt-16 border-t border-slate-200">
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center">
-                <div className="bg-blue-50 p-3 rounded-xl mb-4 text-blue-600">
-                  <Rocket className="w-6 h-6" />
-                </div>
-                <h3 className="font-bold text-slate-900">Swift Delivery</h3>
-                <p className="text-slate-500 text-sm mt-2 text-center">Get professional concepts faster than traditional design agency timelines.</p>
-              </div>
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center">
-                <div className="bg-purple-50 p-3 rounded-xl mb-4 text-purple-600">
-                  <Layout className="w-6 h-6" />
-                </div>
-                <h3 className="font-bold text-slate-900">Scalable Assets</h3>
-                <p className="text-slate-500 text-sm mt-2 text-center">High-resolution outputs ready for digital, print, and branding materials.</p>
-              </div>
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center">
-                <div className="bg-emerald-50 p-3 rounded-xl mb-4 text-emerald-600">
-                  <FileText className="w-6 h-6" />
-                </div>
-                <h3 className="font-bold text-slate-900">Brand Style Guide</h3>
-                <p className="text-slate-500 text-sm mt-2 text-center">Automated color codes and font usage to keep your brand consistent.</p>
-              </div>
-            </div>
+            <button 
+              onClick={() => setStep(AppStep.WIZARD)}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white px-12 py-6 rounded-2xl font-black shadow-2xl transition-all text-xl"
+            >
+              Start Your Design
+            </button>
           </div>
         )}
 
         {step === AppStep.WIZARD && (
-          <div className="max-w-2xl mx-auto bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
-            <div className="p-8 border-b border-slate-100 bg-slate-50">
-              <h2 className="text-2xl font-bold text-slate-900">Brand Discovery</h2>
-              <p className="text-slate-500">Tell us about your business to help the AI designer understand your vision.</p>
+          <div className="max-w-2xl mx-auto bg-white rounded-[2rem] shadow-2xl border border-slate-200 p-10 space-y-8 animate-in slide-in-from-bottom-4">
+            <div className="space-y-2">
+              <h2 className="text-3xl font-black text-slate-900 tracking-tight">Brand Details</h2>
+              <p className="text-slate-500 font-medium">Tell us about your business vision.</p>
             </div>
-            <form onSubmit={handleGenerate} className="p-8 space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+            {errorMsg && (
+              <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex gap-3 text-red-800 text-sm font-bold">
+                <AlertCircle className="w-5 h-5 shrink-0" />
+                {errorMsg}
+              </div>
+            )}
+
+            <form onSubmit={handleGenerate} className="space-y-6">
+              <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <label className="text-sm font-semibold text-slate-700">Business Name</label>
-                  <input 
-                    required
-                    type="text"
-                    className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-                    placeholder="e.g. Bloom Floral Studio"
-                    value={brandInfo.businessName}
-                    onChange={e => setBrandInfo({...brandInfo, businessName: e.target.value})}
-                  />
+                  <label className="text-xs font-black text-slate-400 uppercase tracking-widest">Business Name</label>
+                  <input required className="w-full px-5 py-4 rounded-xl border-2 border-slate-100 focus:border-indigo-500 outline-none font-bold" value={brandInfo.businessName} onChange={e => setBrandInfo({...brandInfo, businessName: e.target.value})} />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm font-semibold text-slate-700">Industry</label>
-                  <input 
-                    required
-                    type="text"
-                    className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-                    placeholder="e.g. Retail, Tech, Healthcare"
-                    value={brandInfo.industry}
-                    onChange={e => setBrandInfo({...brandInfo, industry: e.target.value})}
-                  />
+                  <label className="text-xs font-black text-slate-400 uppercase tracking-widest">Industry</label>
+                  <input required className="w-full px-5 py-4 rounded-xl border-2 border-slate-100 focus:border-indigo-500 outline-none font-bold" value={brandInfo.industry} onChange={e => setBrandInfo({...brandInfo, industry: e.target.value})} />
                 </div>
               </div>
-              
               <div className="space-y-2">
-                <label className="text-sm font-semibold text-slate-700">Core Values / Keywords</label>
-                <textarea 
-                  required
-                  className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all h-24"
-                  placeholder="e.g. Trust, Innovation, Sustainability, Happiness"
-                  value={brandInfo.coreValues}
-                  onChange={e => setBrandInfo({...brandInfo, coreValues: e.target.value})}
-                />
+                <label className="text-xs font-black text-slate-400 uppercase tracking-widest">Core Values</label>
+                <textarea required className="w-full px-5 py-4 rounded-xl border-2 border-slate-100 focus:border-indigo-500 outline-none font-bold h-24" placeholder="e.g. Innovation, Trust, Speed" value={brandInfo.coreValues} onChange={e => setBrandInfo({...brandInfo, coreValues: e.target.value})} />
               </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-semibold text-slate-700">Target Audience</label>
-                <input 
-                  required
-                  type="text"
-                  className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-                  placeholder="e.g. Young eco-conscious professionals"
-                  value={brandInfo.targetAudience}
-                  onChange={e => setBrandInfo({...brandInfo, targetAudience: e.target.value})}
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-semibold text-slate-700">Logo Style Preference</label>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  {['Modern', 'Minimalist', 'Classic', 'Bold'].map(s => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => setBrandInfo({...brandInfo, preferredStyle: s})}
-                      className={`py-3 rounded-xl text-sm font-medium border transition-all ${
-                        brandInfo.preferredStyle === s 
-                        ? "bg-indigo-600 text-white border-indigo-600 shadow-md shadow-indigo-100" 
-                        : "bg-white text-slate-600 border-slate-200 hover:border-indigo-300"
-                      }`}
-                    >
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <button 
-                type="submit"
-                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-4 rounded-xl font-bold shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 transition-all mt-4"
-              >
-                Generate Logo Concepts
-                <Rocket className="w-5 h-5" />
+              <button type="submit" className="w-full bg-slate-900 hover:bg-indigo-600 text-white py-5 rounded-2xl font-black transition-all flex items-center justify-center gap-3 text-lg">
+                Generate My Logo
+                <Rocket className="w-6 h-6" />
               </button>
             </form>
           </div>
         )}
 
         {step === AppStep.GENERATING && (
-          <div className="max-w-xl mx-auto text-center py-20 space-y-6">
-            <div className="relative inline-block">
+          <div className="text-center py-24 space-y-8">
+            <div className="inline-block relative">
               <div className="w-24 h-24 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
-              <Sparkles className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 text-indigo-600" />
+              <Sparkles className="absolute inset-0 m-auto w-8 h-8 text-indigo-600 animate-pulse" />
             </div>
-            <h2 className="text-2xl font-bold text-slate-900">Designing Magic...</h2>
-            <p className="text-slate-500 animate-pulse">{loadingMsg}</p>
+            <h2 className="text-4xl font-black text-slate-900 tracking-tight">Designing...</h2>
+            <p className="text-slate-500 text-xl font-medium animate-pulse">{loadingMsg}</p>
           </div>
         )}
 
         {step === AppStep.GALLERY && (
           <div className="space-y-12">
-            <div className="text-center space-y-2">
-              <h2 className="text-3xl font-bold text-slate-900">Your Initial Logo Concepts</h2>
-              <p className="text-slate-500">Pick the concept that best represents {brandInfo.businessName}</p>
+            <div className="text-center space-y-4">
+              <h2 className="text-5xl font-black text-slate-900 tracking-tight">Initial Concepts</h2>
+              <p className="text-slate-500 text-xl font-medium">Select a concept to refine and generate a style guide.</p>
             </div>
-            
             <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
               {concepts.map((concept) => (
-                <div 
-                  key={concept.id}
-                  className="group bg-white rounded-3xl overflow-hidden shadow-sm hover:shadow-xl transition-all border border-slate-200"
-                >
-                  <div className="aspect-square bg-slate-100 relative">
-                    <img 
-                      src={concept.imageUrl} 
-                      alt={concept.conceptName} 
-                      className="w-full h-full object-contain p-4 group-hover:scale-105 transition-transform duration-500"
-                    />
-                    <div className="absolute inset-0 bg-black/5 group-hover:bg-transparent transition-colors" />
+                <div key={concept.id} className="bg-white rounded-[2rem] border border-slate-200 overflow-hidden hover:shadow-2xl transition-all group flex flex-col">
+                  <div className="aspect-square p-8 bg-slate-50 flex items-center justify-center relative overflow-hidden">
+                    <img src={concept.imageUrl} alt={concept.conceptName} className="w-full h-full object-contain drop-shadow-xl group-hover:scale-110 transition-transform duration-700" />
                   </div>
-                  <div className="p-6 space-y-4">
-                    <div>
-                      <h3 className="text-xl font-bold text-slate-900">{concept.conceptName}</h3>
-                      <p className="text-sm text-slate-500 mt-1">{concept.description}</p>
-                    </div>
-                    <button 
-                      onClick={() => handleSelectLogo(concept)}
-                      className="w-full bg-slate-900 hover:bg-indigo-600 text-white py-3 rounded-xl font-semibold transition-colors flex items-center justify-center gap-2"
-                    >
-                      Select Concept
-                      <CheckCircle2 className="w-4 h-4" />
+                  <div className="p-8 space-y-4 flex-1 flex flex-col justify-between">
+                    <h3 className="text-2xl font-black text-slate-900">{concept.conceptName}</h3>
+                    <button onClick={() => handleSelectLogo(concept)} className="w-full bg-slate-900 hover:bg-indigo-600 text-white py-4 rounded-xl font-black transition-all">
+                      Select This Design
                     </button>
                   </div>
                 </div>
               ))}
             </div>
-            
-            <div className="flex justify-center mt-12">
-              <button 
-                onClick={() => setStep(AppStep.WIZARD)}
-                className="text-slate-500 hover:text-indigo-600 font-semibold underline decoration-2 underline-offset-4"
-              >
-                Not feeling these? Refine your brand details and retry.
-              </button>
-            </div>
           </div>
         )}
 
         {step === AppStep.STYLE_GUIDE && styleGuide && selectedConcept && (
-          <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in zoom-in-95 duration-500">
-            <div className="flex flex-col md:flex-row gap-8 items-start">
-              {/* Logo Showcase */}
-              <div className="w-full md:w-1/2 bg-white p-8 rounded-3xl shadow-xl border border-slate-100">
-                <div className="aspect-square bg-slate-50 rounded-2xl flex items-center justify-center overflow-hidden border border-slate-100">
-                   <img src={selectedConcept.imageUrl} alt="Final Selection" className="w-full h-full object-contain" />
-                </div>
-                <div className="mt-6 space-y-4">
-                  <h3 className="text-2xl font-bold text-slate-900">The Winner</h3>
-                  <div className="flex flex-wrap gap-2">
-                    <button className="flex-1 bg-indigo-600 text-white px-4 py-3 rounded-xl font-bold flex items-center justify-center gap-2">
-                      <Download className="w-4 h-4" /> PNG
-                    </button>
-                    <button className="flex-1 bg-indigo-50 text-indigo-600 px-4 py-3 rounded-xl font-bold flex items-center justify-center gap-2">
-                      <Layers className="w-4 h-4" /> SVG
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Style Guide */}
-              <div className="w-full md:w-1/2 space-y-6">
-                <div className="bg-white p-8 rounded-3xl shadow-lg border border-slate-100 space-y-6">
-                  <h2 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
-                    <FileText className="w-6 h-6 text-indigo-600" />
-                    Brand Style Guide
-                  </h2>
-
-                  <div className="space-y-4">
-                    <h4 className="text-sm font-bold text-slate-400 uppercase tracking-widest">Color Palette</h4>
-                    <div className="grid grid-cols-3 gap-4">
-                      <div className="space-y-2">
-                        <div className="h-16 rounded-xl shadow-inner border border-slate-100" style={{ backgroundColor: styleGuide.primaryColor }}></div>
-                        <p className="text-xs font-mono font-bold text-center">{styleGuide.primaryColor}</p>
-                        <p className="text-[10px] text-slate-400 text-center">Primary</p>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="h-16 rounded-xl shadow-inner border border-slate-100" style={{ backgroundColor: styleGuide.secondaryColor }}></div>
-                        <p className="text-xs font-mono font-bold text-center">{styleGuide.secondaryColor}</p>
-                        <p className="text-[10px] text-slate-400 text-center">Secondary</p>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="h-16 rounded-xl shadow-inner border border-slate-100" style={{ backgroundColor: styleGuide.accentColor }}></div>
-                        <p className="text-xs font-mono font-bold text-center">{styleGuide.accentColor}</p>
-                        <p className="text-[10px] text-slate-400 text-center">Accent</p>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    <h4 className="text-sm font-bold text-slate-400 uppercase tracking-widest">Typography</h4>
-                    <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
-                      <p className="text-lg font-semibold" style={{ fontFamily: styleGuide.fontFamily }}>{styleGuide.fontFamily}</p>
-                      <p className="text-sm text-slate-500">Modern sans-serif typeface optimized for readability across digital and print.</p>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    <h4 className="text-sm font-bold text-slate-400 uppercase tracking-widest">Usage Tips</h4>
-                    <ul className="space-y-2">
-                      {styleGuide.usageTips.map((tip, idx) => (
-                        <li key={idx} className="flex items-start gap-2 text-sm text-slate-600">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-500 mt-0.5 shrink-0" />
-                          {tip}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-                
-                <button 
-                  onClick={() => window.print()}
-                  className="w-full bg-slate-900 text-white py-4 rounded-xl font-bold shadow-lg flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors"
-                >
-                  Download Full Brand Package
-                  <Download className="w-5 h-5" />
-                </button>
+          <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-10 animate-in fade-in duration-1000">
+            <div className="bg-white p-10 rounded-[2rem] shadow-xl border border-slate-200 h-fit sticky top-24">
+              <img src={selectedConcept.imageUrl} alt="Final Logo" className="w-full aspect-square object-contain p-4 mb-8 bg-slate-50 rounded-xl" />
+              <div className="flex gap-4">
+                <button onClick={() => window.print()} className="flex-1 bg-indigo-600 text-white py-4 rounded-xl font-black flex items-center justify-center gap-2 shadow-lg shadow-indigo-100"><Download className="w-5 h-5" /> Export Brand</button>
               </div>
             </div>
-            
-            <div className="text-center pt-8">
-              <button 
-                onClick={() => setStep(AppStep.IDLE)}
-                className="text-indigo-600 font-bold hover:underline"
-              >
-                Start New Project
-              </button>
+            <div className="space-y-8">
+              <div className="bg-white p-10 rounded-[2rem] shadow-xl border border-slate-200 space-y-8">
+                <h2 className="text-3xl font-black text-slate-900">Brand Guide</h2>
+                <div className="space-y-4">
+                  <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Colors</p>
+                  <div className="grid grid-cols-3 gap-4">
+                    {[styleGuide.primaryColor, styleGuide.secondaryColor, styleGuide.accentColor].map((c, i) => (
+                      <div key={i} className="space-y-2">
+                        <div className="h-16 rounded-xl border border-slate-100" style={{backgroundColor: c}}></div>
+                        <p className="text-[10px] font-mono font-black text-center">{c}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="space-y-4">
+                  <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Typography</p>
+                  <div className="p-6 bg-slate-50 rounded-xl border border-slate-100">
+                    <p className="text-4xl font-black" style={{fontFamily: styleGuide.fontFamily}}>{styleGuide.fontFamily}</p>
+                    <p className="text-xs text-slate-400 mt-2 italic">Suggested for headings and digital interfaces.</p>
+                  </div>
+                </div>
+                <div className="space-y-4">
+                  <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Guidelines</p>
+                  <ul className="space-y-2">
+                    {styleGuide.usageTips.map((tip, i) => (
+                      <li key={i} className="flex gap-3 text-sm font-bold text-slate-600">
+                        <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
+                        {tip}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <button onClick={() => setStep(AppStep.IDLE)} className="text-indigo-600 font-black text-sm uppercase tracking-widest hover:underline">New Project</button>
             </div>
           </div>
         )}
       </main>
 
-      {/* Footer */}
-      <footer className="bg-white border-t border-slate-200 py-12">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex flex-col md:flex-row justify-between items-center gap-6">
-            <div className="flex items-center gap-2">
-              <Palette className="w-5 h-5 text-indigo-600" />
-              <span className="text-lg font-bold text-slate-900 tracking-tight">Logosmith AI</span>
-            </div>
-            <p className="text-slate-500 text-sm">
-              &copy; {new Date().getFullYear()} Logosmith AI. Professional branding for every entrepreneur.
-            </p>
-            <div className="flex gap-6 text-sm font-medium text-slate-400">
-              <a href="#" className="hover:text-indigo-600">Terms</a>
-              <a href="#" className="hover:text-indigo-600">Privacy</a>
-              <a href="#" className="hover:text-indigo-600">Support</a>
-            </div>
-          </div>
-        </div>
+      <footer className="bg-white border-t border-slate-200 py-12 text-center">
+        <p className="text-slate-400 font-bold text-sm">Powered by Gemini Cloud Creative &copy; {new Date().getFullYear()} Logosmith Studio.</p>
       </footer>
     </div>
   );
