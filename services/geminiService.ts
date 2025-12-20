@@ -2,13 +2,12 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { BrandInfo, LogoConcept, StyleGuide } from "../types";
 
-const API_KEY = process.env.API_KEY || "";
-
 export class GeminiService {
-  private static ai = new GoogleGenAI({ apiKey: API_KEY });
+  // We create a fresh instance inside each method to ensure the latest API key is used
+  // and to avoid issues with process.env access during module loading.
 
   static async generateLogoConcepts(brand: BrandInfo): Promise<LogoConcept[]> {
-    const concepts: LogoConcept[] = [];
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
     // We'll generate 3 different variations by varying the prompt slightly
     const styles = [
@@ -18,12 +17,12 @@ export class GeminiService {
     ];
 
     const promises = styles.map(async (styleModifier, index) => {
-      const prompt = `Professional professional logo for a small business named "${brand.businessName}" in the ${brand.industry} industry. 
+      const prompt = `Professional logo for a small business named "${brand.businessName}" in the ${brand.industry} industry. 
       Values: ${brand.coreValues}. Style: ${brand.preferredStyle}, ${styleModifier}. 
       Target Audience: ${brand.targetAudience}. 
       The logo should be modern, memorable, high resolution, white background, no text besides the business name if appropriate.`;
 
-      const response = await this.ai.models.generateContent({
+      const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
         contents: { parts: [{ text: prompt }] },
         config: {
@@ -50,13 +49,14 @@ export class GeminiService {
   }
 
   static async generateStyleGuide(brand: BrandInfo, selectedLogo: LogoConcept): Promise<StyleGuide> {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const prompt = `Based on a logo that is ${selectedLogo.description} for "${brand.businessName}", 
     provide a professional style guide including:
     1. Primary, Secondary, and Accent hex colors that match this aesthetic.
     2. A professional font suggestion from Google Fonts.
     3. 3-4 usage tips for maintaining brand consistency.`;
 
-    const response = await this.ai.models.generateContent({
+    const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
